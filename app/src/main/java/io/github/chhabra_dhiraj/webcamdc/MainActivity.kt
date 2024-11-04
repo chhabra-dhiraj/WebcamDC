@@ -2,26 +2,49 @@ package io.github.chhabra_dhiraj.webcamdc
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaFormat
 import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
 import android.util.Log
+import android.util.Size
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.MediaStoreOutputOptions
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
+import androidx.core.content.PermissionChecker
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.net.Socket
+import java.nio.ByteBuffer
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var cameraExecutor: ExecutorService
+    private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private var cameraProvider: ProcessCameraProvider? = null
+
     private var socket: Socket? = null
+
+    private var mediaCodec: MediaCodec? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -33,18 +56,16 @@ class MainActivity : AppCompatActivity() {
         } else {
             requestPermissions()
         }
-
-        // Initialize camera and executor
-        cameraExecutor = Executors.newSingleThreadExecutor()
-
-        // Establish a socket connection to the macOS server
-//        startSocketConnection()
     }
 
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        bindCameraUseCases()
+
         cameraProviderFuture.addListener({
-            val cameraProvider = cameraProviderFuture.get()
+            // Used to bind the lifecycle of cameras to the lifecycle owner
+            cameraProvider = cameraProviderFuture.get()
+            val provider = cameraProvider ?: return@addListener
 
             // Preview
             val preview = Preview.Builder()
@@ -52,71 +73,112 @@ class MainActivity : AppCompatActivity() {
                 .also {
                     it.surfaceProvider = findViewById<PreviewView>(R.id.viewFinder).surfaceProvider
                 }
-            val imageCapture = ImageCapture.Builder().build()
 
+            // Select back camera as a default
             val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
             try {
-                cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(
-                    this, cameraSelector, preview, imageCapture
+                // Unbind use cases before rebinding
+                provider.unbindAll()
+
+                // Bind use cases to camera
+                provider.bindToLifecycle(
+                    this, cameraSelector, preview
                 )
+
             } catch (exc: Exception) {
                 Log.e(TAG, "Use case binding failed", exc)
             }
 
-            // Start capturing images periodically and sending to the server
-//            startStreaming(imageCapture)
-
         }, ContextCompat.getMainExecutor(this))
     }
 
-//    private fun startStreaming(imageCapture: ImageCapture) {
-//        val intervalMillis = 100 // Adjust for the desired frame rate
-//        val runnable = object : Runnable {
-//            override fun run() {
-//                imageCapture.takePicture(ContextCompat.getMainExecutor(this@MainActivity), object : ImageCapture.OnImageCapturedCallback() {
-//                    override fun onCaptureSuccess(image: ImageProxy) {
-//                        val byteArray = imageToByteArray(image)
-//                        sendFrame(byteArray)
-//                        image.close()
-//                    }
-//                })
-//                cameraExecutor.schedule(this, intervalMillis.toLong(), TimeUnit.MILLISECONDS)
-//            }
-//        }
-//        cameraExecutor.schedule(runnable, intervalMillis.toLong(), TimeUnit.MILLISECONDS)
-//    }
-//
-//    private fun imageToByteArray(image: ImageProxy): ByteArray {
-//        val bitmap = // Convert ImageProxy to Bitmap
-//        val stream = ByteArrayOutputStream()
-//        bitmap.compress(Bitmap.CompressFormat.JPEG, 50, stream) // Compress to reduce size
-//        return stream.toByteArray()
-//    }
-//
-//    private fun startSocketConnection() {
-//        Thread {
-//            try {
-//                socket = Socket("localhost", 9000) // Mac server IP
-//            } catch (e: Exception) {
-//                e.printStackTrace()
-//            }
-//        }.start()
-//    }
-//
-//    private fun sendFrame(frame: ByteArray) {
-//        socket?.getOutputStream()?.write(frame)
-//        socket?.getOutputStream()?.flush()
-//    }
-//
+    private fun bindCameraUseCases() {
+        val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+        val preview = Preview.Builder().build()
+        val imageAnalysis = ImageAnalysis.Builder()
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .build()
 
-    private fun requestPermissions() {
-        activityResultLauncher.launch(REQUIRED_PERMISSIONS)
+        imageAnalysis.setAnalyzer(cameraExecutor) { image ->
+            try {
+                encodeAndSendFrame(image)
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Error encoding or sending frame", e)
+            } finally {
+                image.close()
+            }
+        }
+
+        cameraProvider?.bindToLifecycle(this, cameraSelector, preview, imageAnalysis)
+    }
+
+    private fun encodeAndSendFrame(image: ImageProxy) {
+        // 1. Initialize MediaCodec if not already initialized
+        val codec: MediaCodec
+        if (mediaCodec == null) {
+            mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            val format = MediaFormat.createVideoFormat(
+                MediaFormat.MIMETYPE_VIDEO_AVC,
+                image.width,
+                image.height
+            )
+            codec = mediaCodec ?: return
+            // Configure MediaFormat with desired encoding parameters
+            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            codec.start()
+        } else {
+            codec = mediaCodec ?: return
+        }
+
+        // 2. Get image data
+        val buffer = image.planes[0].buffer
+        val bufferSize = buffer.remaining()
+        val data = ByteArray(bufferSize)
+        buffer.get(data)
+
+        // 3. Encode frame
+        val inputBufferIndex = codec.dequeueInputBuffer(TIMEOUT_US)
+        if (inputBufferIndex >= 0) {
+            val inputBuffer = codec.getInputBuffer(inputBufferIndex)
+            inputBuffer?.put(data)
+            codec.queueInputBuffer(
+                inputBufferIndex,
+                0,
+                bufferSize,
+                image.imageInfo.timestamp,
+                0
+            )
+        }
+
+        // 4. Send encoded data over socket
+        val bufferInfo = MediaCodec.BufferInfo()
+        val outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, TIMEOUT_US)
+        if (outputBufferIndex >= 0) {
+            val outputBuffer = codec.getOutputBuffer(outputBufferIndex)
+            val encodedData = ByteArray(bufferInfo.size)
+            outputBuffer?.get(encodedData)
+
+            // Send encodedData over socket
+            if (socket == null || socket?.isClosed == true) {
+                socket = Socket("192.168.0.107", 8080)
+            }
+            val lSocket = socket ?: return
+
+            lSocket.outputStream.write(encodedData)
+
+            mediaCodec?.releaseOutputBuffer(outputBufferIndex, false)
+        }
     }
 
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
-        ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
+        ContextCompat.checkSelfPermission(
+            baseContext, it
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun requestPermissions() {
+        activityResultLauncher.launch(REQUIRED_PERMISSIONS)
     }
 
     private val activityResultLauncher =
@@ -143,12 +205,14 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        mediaCodec?.stop()
+        mediaCodec?.release()
+        socket?.close()
         cameraExecutor.shutdown()
-//        socket?.close()
     }
 
     companion object {
-        private const val TAG = "WebcamDC"
+        private const val TAG = "WebcamDCVideoStreaming"
         private val REQUIRED_PERMISSIONS = mutableListOf(
             Manifest.permission.CAMERA,
             Manifest.permission.RECORD_AUDIO
@@ -157,5 +221,6 @@ class MainActivity : AppCompatActivity() {
                 add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
             }
         }.toTypedArray()
+        private const val TIMEOUT_US = 10000L
     }
 }
